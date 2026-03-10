@@ -1,89 +1,64 @@
-from typing import Dict, Any
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_core.prompts import PromptTemplate
-from langchain_community.vectorstores.pinecone import Pinecone as PineconeVS
+import os
+import json
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from pinecone import Pinecone
-try:
-    from .config import settings
-except ImportError:
-    from config import settings
+from langchain_pinecone import PineconeVectorStore
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 
-SYSTEM_PROMPT = """
-You are DocuMind Enterprise, a corporate SOP assistant.
-
-CRITICAL RULES:
-- Answer ONLY using the information provided in the context.
-- If the answer is not in the context, say: "I don't know. This is outside my scope."
-- Do not use any external knowledge or assumptions.
-- Always include brief source citations using the metadata (document name, page if available).
-
-Context:
-{context}
-
-Question: {question}
-"""
-
-def get_vectorstore(namespace: str = "sop"):
-    embeddings = OpenAIEmbeddings(
-        model=settings.embedding_model,
-        api_key=settings.openai_api_key,
-    )
-    # Initialize Pinecone client
-    pc = Pinecone(api_key=settings.pinecone_api_key)
-    index = pc.Index(settings.pinecone_index)
+def get_vectorstore():
+    pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+    index_name = os.getenv("PINECONE_INDEX")
+    index = pc.Index(index_name)
     
-    return PineconeVS(
+    embeddings = GoogleGenerativeAIEmbeddings(
+        model="models/gemini-embedding-001",
+        output_dimensionality=768
+    )
+    
+    return PineconeVectorStore(
         index=index,
         embedding=embeddings,
         text_key="text",
-        namespace=namespace,
+        namespace="sop"
     )
 
-def build_retrieval_chain(namespace: str = "sop"):
-    vs = get_vectorstore(namespace)
-    retriever = vs.as_retriever(search_kwargs={"k": 5})
-
-    prompt = PromptTemplate(
-        input_variables=["context", "question"],
-        template=SYSTEM_PROMPT,
-    )
-
-    llm = ChatOpenAI(
-        model="gpt-4o",
-        temperature=0.0,
-        api_key=settings.openai_api_key,
-    )
-
-    # Build a simple retrieval chain using LCEL
-    def format_docs(docs):
-        return "\n\n".join([doc.page_content for doc in docs])
-
-    chain = (
-        {"context": retriever | format_docs, "question": lambda x: x["question"]}
-        | prompt
-        | llm
-    )
-    return {"chain": chain, "retriever": retriever}
-
-def answer_question(question: str, namespace: str = "sop") -> Dict[str, Any]:
-    chain_data = build_retrieval_chain(namespace)
-    chain = chain_data["chain"]
-    retriever = chain_data["retriever"]
+def stream_answer(question: str):
+    vectorstore = get_vectorstore()
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
     
-    # Get the answer from the chain
-    answer = chain.invoke({"question": question})
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0, streaming=True)
     
-    # Get source documents
-    source_docs = retriever.invoke(question)
-    sources = []
-    for doc in source_docs:
-        meta = doc.metadata
-        sources.append(
-            {
-                "source": meta.get("source", ""),
-                "page": meta.get("page", None),
-                "chunk_id": meta.get("chunk_id", None),
-            }
-        )
-    return {"answer": answer.content if hasattr(answer, "content") else str(answer), "sources": sources}
+    docs = retriever.invoke(question)
+    sources = [doc.metadata.get("source", "Unknown") for doc in docs]
+    
+    context_text = "\n\n".join([doc.page_content for doc in docs])
+    
+    template = """You are a strict, highly accurate corporate AI assistant for DocuMind.
+Your primary directive is to answer the user's question using ONLY the provided Context.
+
+CRITICAL RULES:
+1. If the exact answer is not explicitly written in the Context below, you MUST refuse to answer and reply ONLY with: "This is outside my scope."
+2. Do not rely on outside knowledge.
+3. Do not invent, guess, or fabricate facts.
+
+Context: {context}
+
+Question: {question}
+Answer:"""
+
+    prompt = PromptTemplate.from_template(template)
+    
+    chain = prompt | llm | StrOutputParser()
+    
+    def generate():
+        yield json.dumps({"type": "metadata", "sources": list(set(sources))}) + "\n"
+        
+        for chunk in chain.stream({"context": context_text, "question": question}):
+            yield json.dumps({"type": "content", "content": chunk}) + "\n"
+            
+    return generate()
